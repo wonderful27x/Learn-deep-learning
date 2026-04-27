@@ -1,0 +1,107 @@
+from mxnet import autograd, gluon, init, np, npx
+from mxnet.gluon import nn
+from d2l import mxnet as d2l
+
+npx.set_np()
+
+# 卷积神经网络
+# 网络中的网络，使用了1x1卷积层
+# nin块中是一个普通卷积层+2个1x1卷积层
+def nin_block(num_channels, kernel_size, strides, padding):
+    blk = nn.Sequential()
+    blk.add(nn.Conv2D(num_channels, kernel_size, strides, padding, activation='relu'),
+            nn.Conv2D(num_channels, kernel_size=1, activation='relu'),
+            nn.Conv2D(num_channels, kernel_size=1, activation='relu'))
+    return blk
+
+net = nn.Sequential()
+net.add(
+        nin_block(channels=96, kernel_size=11, strides=4, padding=0),
+        nn.MaxPool2D(pool_size=3, strides=2),
+        nn.Conv2D(channels=256, kernel_size=5, strides=1, padding=2),
+        nn.MaxPool2D(pool_size=3, strides=2),
+        nn.Conv2D(384, kernel_size=3, strides=1, padding=1),
+        nn.MaxPool2D(pool_size=3, strides=2),
+        nn.Dropout(0.5),
+        # 标签类别数是10, 代替了全连接层，1x1卷积层就相当于在每个像素位置应用的全连接层
+        nin_block(10, kernel_size=3, strides=1, padding=1),
+        # 全局平均汇聚层将窗口形状自动设置成输入的高和宽
+        nn.GlobalAvgPool2D(),
+        # 将四维的输出转成二维的输出，其形状为(批量大小,10)
+        nn.Flatten()
+
+# 测试1个样本，1个通道，28x28
+# X = np.random.uniform(size=(1, 1, 28, 28))
+X = np.random.uniform(size=(1, 1, 224, 224))
+net.initialize()
+for layer in net:
+    X = layer(X)
+    print(layer.name, 'output shape:\t', X.shape)
+
+# 在整个卷积块中，与上一层相比，每一层特征的高度和宽度都减小了。 第一个卷积层使用2个像素的填充，来补偿
+# 卷积核导致的特征减少。 相反，第二个卷积层没有填充，因此高度和宽度都减少了4个像素。 随着层叠的上升，通道的数量从输入时的1个，增加到第一个卷积层之后的6个，再到第二个卷积层之后的16个。 同时，每个汇聚层的高度和宽度都减半。最后，每个全连接层减少维数，最终输出一个维数与结果分类数相匹配的输出。
+
+# 训练模型
+batch_size = 128
+# train_iter, test_iter = d2l.load_data_fashion_mnist(batch_size)
+train_iter, test_iter = d2l.load_data_fashion_mnist(batch_size, resize=224)
+
+def evaluate_accuracy_gpu(net, data_iter, device=None):
+    """使用gpu计算模型在数据集上的精度"""
+    if not device:
+        device = list(net.collect_params().values())[0].list_ctx()[0]
+    metric = d2l.Accumulator(2)
+    for X, y in data_iter:
+        X, y = X.as_in_ctx(device), y.as_in_ctx(device)
+        metric.add(d2l.accuracy(net(X), y), d2l.size(y))
+    return metric[0] / metric[1]
+
+def train_ch6(net, train_iter, test_iter, num_epochs, lr, device):
+    """用gpu训练模型（在第六章定义）"""
+    net.initialize(force_reinit=True, ctx=device, init=init.Xavier())
+    loss = gluon.loss.SoftmaxCrossEntropyLoss()
+    trainer = gluon.Trainer(net.collect_params(), 'sgd', {'learning_rate': lr})
+    animator = d2l.Animator(xlabel='epoch', xlim=[1, num_epochs],
+                            legend=['train_loss', 'train acc', 'test acc'])
+    timer, num_batches = d2l.Timer(), len(train_iter)
+    for epoch in range(num_epochs):
+        metric = d2l.Accumulator(3) # 训练损失之和，训练准确率之和，样本数
+        for i, (X, y) in enumerate(train_iter):
+            timer.start()
+            # 下面是与“d2l.train_epoch_ch3”的主要不同
+            X, y = X.as_in_ctx(device), y.as_in_ctx(device)
+            with autograd.record():
+                y_hat = net(X)
+                l = loss(y_hat, y)
+            l.backward()
+            trainer.step(X.shape[0])
+            metric.add(l.sum(), d2l.accuracy(y_hat, y), X.shape[0])
+            timer.stop()
+            train_l = metric[0] / metric[2]
+            train_acc = metric[1] / metric[2]
+            if (i+1) % (num_batches // 5) == 9 or i == num_batches - 1:
+                animator.add(epoch + (i+1) / num_batches, (train_l, train_acc, None))
+        test_acc = evaluate_accuracy_gpu(net, test_iter)
+        animator.add(epoch + 1, (None, None, test_acc))
+    print(f'loss{train_l:.3f}, train acc {train_acc:.3f}, '
+          f'test acc {test_acc:.3f}')
+    print(f'{metric[2] * num_epochs / timer.sum():.1f} examples/sec '
+          f'on{str(device)}')
+
+# 预测
+def predict_ch3(net, test_iter, n=6):  #@save
+    """预测标签（定义见第3章）"""
+    for X, y in test_iter:
+        break
+    trues = d2l.get_fashion_mnist_labels(y)
+    preds = d2l.get_fashion_mnist_labels(net(X).argmax(axis=1))
+    titles = [true +'\n' + pred for true, pred in zip(trues, preds)]
+    d2l.show_images(
+        X[0:n].reshape((n, 224, 224)), 1, n, titles=titles[0:n])
+
+# 训练
+lr, num_epochs = 0.1, 10
+train_ch6(net, train_iter, test_iter, num_epochs, lr, d2l.try_gpu())
+
+# 预测
+predict_ch3(net, test_iter)
