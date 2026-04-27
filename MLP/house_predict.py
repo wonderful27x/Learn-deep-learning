@@ -8,6 +8,7 @@ import requests
 # !pip install pandas
 
 # %matplotlib inline
+import mxnet as mx
 import pandas as pd
 from mxnet import autograd, gluon, init, np, npx
 from mxnet.gluon import nn
@@ -104,8 +105,12 @@ loss = gluon.loss.L2Loss()
 # 线性模型
 def get_net():
     net = nn.Sequential()
+    # net.add(nn.Dense(100, activation='relu'),
+    #         nn.Dropout(0.2),
+    #         nn.Dense(1))
     net.add(nn.Dense(1))
     net.initialize()
+    # net.initialize(mx.init.Xavier(), ctx=mx.cpu())
     return net
 
 # 计算对数形式的均方根误差
