@@ -159,23 +159,12 @@ def load_data_nmt(batch_size, num_steps, num_examples=600):
      return data_iter, src_vocab, tgt_vocab
 
 # 读取第一个小批量数据
-train_iter, src_vocab, tgt_vocab = load_data_nmt(batch_size=5, num_steps=10)
-print("小批量数据集测试:")
+train_iter, src_vocab, tgt_vocab = load_data_nmt(batch_size=2, num_steps=8)
 for X, X_valid_len, Y, Y_valid_len in train_iter:
-   print('X: ', X.astype(np.int32))
-   print('X的有效长度: ', X_valid_len)
-   print('Y: ', Y.astype(np.int32))
-   print('Y的有效长度: ', Y_valid_len)
-
-   for i in range(len(X_valid_len)):
-       row = X.astype(np.int32)[i]
-       print("x-idx: ", row)
-       print("x-str: ", src_vocab.to_tokens(row.tolist()), " valid_len:", X_valid_len[i])
-
-       row = Y.astype(np.int32)[i]
-       print("y-idx: ", row)
-       print("y-str: ", tgt_vocab.to_tokens(row.tolist()), " valid_len:", Y_valid_len[i])
-
+   print('X:', X.astype(np.int32))
+   print('X的有效长度:', X_valid_len)
+   print('Y:', Y.astype(np.int32))
+   print('Y的有效长度:', Y_valid_len)
    break
 
 # 编解码器架构
@@ -274,10 +263,9 @@ class Seq2SeqDecoder(d2l.Decoder):
         # 将编码器的输出state和X合并作为解码器输入，
         # 注意这里是将编码器最后一个时间步的state拼接到解码器的每一个时间步上, 相当于做了多份拷贝
         # 这里我们应该联想到因为拼接，所以权重矩阵W_x也被扩大了，
-        # 因为W_x的大小为inputsxnum_hiddens = (embed_size + num_hiddens) x num_hiddens = (32+32) x 32
-        # 这里可以测试一下, !!!需要用RNN网络测试, GRU需要x3
-        # print("解码器网络参数keys：", self.rnn.collect_params().keys)
-        # print("解码器网络权重矩阵：", self.rnn.collect_params())
+        # 因为W_x的大小为inputsxnum_hiddens = (embed_size + num_hiddens) x num_hiddens = (8+16) x 16
+        # 这里可以测试一下
+        print("解码器第0层rnn网络权重矩阵：", self.rnn.collect_params()['rnn0_i2h_weight'].data().shape)
         # 这里特别需要理解的是,X实际是标签（label(t-1)),
         # 将标签(不包含最后一个)作为输入,这称为强制教学，
         # 按道理应该是用前面预测的输出作为输入去预测下一个词，
@@ -289,7 +277,6 @@ class Seq2SeqDecoder(d2l.Decoder):
         X_and_context = np.concatenate((X, context), 2)
         output, state = self.rnn(X_and_context, state)
         output = self.dense(output).swapaxes(0, 1)
-        # print("X.shape: ", X.shape, "X_and_context.shape: ", X_and_context.shape)
         # output的形状:(batch_size,num_steps,vocab_size)
         # state的形状:(num_layers,batch_size,num_hiddens)
         return output, state
