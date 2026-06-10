@@ -67,6 +67,10 @@ class AdditiveAttention(nn.Block):
         self.attention_weights = masked_softmax(scores, valid_lens)
         # values的形状：(batch_size，“键－值”对的个数，值的维度)
         # 根据权重矩阵对值进行加权
+        # 输出的形状: (batch_size, 查询的个数, 值的维度)
+        # 输入(全连接层转换后)queries的形状：(batch_size，查询的个数，num_hidden)
+        # 输入(全连接层转换后)key的形状：(batch_size，“键－值”对的个数，num_hiddens)
+        # 这里由于有一个中间转换，看下面的缩放点击注意力更直观
         return npx.batch_dot(self.dropout(self.attention_weights), values)
 
 # test
@@ -101,12 +105,14 @@ class DotProductAttention(nn.Block):
     # queries的形状：(batch_size，查询的个数，d)
     # keys的形状：(batch_size，“键－值”对的个数，d)
     # values的形状：(batch_size，“键－值”对的个数，值的维度)
-    # valid_lens的形状:(batch_size，)或者(batch_size，查询的个数)
+    # valid_lens的形状: (batch_size，)或者(batch_size，查询的个数)
+    # 最终输出形状: (batch_size, 查询个数, 值的维度)
     def forward(self, queries, keys, values, valid_lens=None):
         d = queries.shape[-1]
         # 设置transpose_b=True为了交换keys的最后两个维度
         scores = npx.batch_dot(queries, keys, transpose_b=True) / math.sqrt(d)
         self.attention_weights = masked_softmax(scores, valid_lens)
+
         return npx.batch_dot(self.dropout(self.attention_weights), values)
 
 queries = np.random.normal(0, 1, (2, 1, 2))
@@ -117,3 +123,97 @@ print("缩放点积注意力")
 print(attention_value)
 d2l.show_heatmaps(attention.attention_weights.reshape((1, 1, 2, 10)),
                   xlabel='Keys', ylabel='Queries')
+
+
+# 10.5. 多头注意力
+# 多头注意力是先将查询、键和值进行线性投影，映射到一个新的空间产生h组值，然后将这h组
+# 变换后的查询、键和值并行送到注意力汇聚，最后将它们的输出拼接在一起。这样每一组注意力汇聚
+# (称为头head)可以得到不同类别的注意焦点的注意力
+# 比如: “猫坐在垫子上，因为它很柔软。”
+# 普通注意力会：
+# 计算“它”与句中每个词的相关性
+# 给“垫子”最高权重（因为“它”指代垫子）
+# 给“柔软”较高权重（因为描述垫子）
+# 给“猫”较低权重
+# 4个头可能分别关注：
+# 头编号	关注的关系类型	对“它”的注意力分布
+# Head 1	指代关系	“垫子”权重最高
+# Head 2	属性关系	“柔软”权重最高
+# Head 3	空间关系	“坐在”权重较高
+# Head 4	对比关系	“猫”（对比）权重较高
+
+# 多头注意力每头head的隐藏单元数为原num_hiddens/heads
+# 多头注意力融合了来自于多个注意力汇聚的不同知识，这些知识的不同来源于相同的查询、键和值的不同的子空间表示。
+class MultiHeadAttention(nn.Block):
+    def __init__(self, num_hiddens, num_heads, dropout, use_bias=False, **kwargs):
+        super(MultiHeadAttention, self).__init__(**kwargs)
+        self.num_heads = num_heads
+        # 使用缩放点积注意力
+        self.attention = DotProductAttention(dropout)
+        # 查询、键、值的线性映射
+        self.W_q = nn.Dense(num_hiddens, use_bias=use_bias, flatten=False)
+        self.W_k = nn.Dense(num_hiddens, use_bias=use_bias, flatten=False)
+        self.W_v = nn.Dense(num_hiddens, use_bias=use_bias, flatten=False)
+        # 最终的拼接, 拼接后输出的形状和单头的形状一样的
+        self.W_o = nn.Dense(num_hiddens, use_bias=use_bias, flatten=False)
+
+    def forward(self, queries, keys, values, valid_lens):
+        # queries，keys，values的形状:
+        # (batch_size，查询或者“键－值”对的个数，num_hiddens)
+        # valid_lens　的形状:
+        # (batch_size，)或(batch_size，查询的个数)
+        # 经过变换后，输出的queries，keys，values　的形状:
+        # (batch_size*num_heads，查询或者“键－值”对的个数，num_hiddens/num_heads)
+        queries = transpose_qkv(self.W_q(queries), self.num_heads)
+        keys = transpose_qkv(self.W_k(keys), self.num_heads)
+        values = transpose_qkv(self.W_v(values), self.num_heads)
+
+        if valid_lens is not None:
+            # 在轴0，将第一项（标量或者矢量）复制num_heads次，
+            # 然后如此复制第二项，然后诸如此类。
+            valid_lens = valid_lens.repeat(self.num_heads, axis=0)
+
+        # 注意这里经过转换后输入attention, 相当于并行运算多个head
+        # output的形状:(batch_size*num_heads，查询的个数，
+        # num_hiddens/num_heads)
+        output = self.attention(queries, keys, values, valid_lens)
+        self.attention_weights = self.attention.attention_weights
+
+        # output_concat的形状:(batch_size，查询的个数，num_hiddens), 和单头完全一致
+        output_concat = transpose_output(output, self.num_heads)
+        # 需要注意的是W_o变换并未改变输出的形状，然而它是必要的
+        # 在上面只是简单地将每个头学到的东西拼接，这里进行线性组合, 是真正的融合
+        return self.W_o(output_concat)
+
+def transpose_qkv(X, num_heads):
+    """为了多注意力头的并行计算而变换形状"""
+    # 输入X的形状:(batch_size，查询或者“键－值”对的个数，num_hiddens)
+    # 输出X的形状:(batch_size，查询或者“键－值”对的个数，num_heads，
+    # num_hiddens/num_heads)
+    X = X.reshape(X.shape[0], X.shape[1], num_heads, -1)
+
+    # 输出X的形状:(batch_size，num_heads，查询或者“键－值”对的个数,
+    # num_hiddens/num_heads)
+    X = X.transpose(0, 2, 1, 3)
+
+    # 最终输出的形状:(batch_size*num_heads,查询或者“键－值”对的个数,
+    # num_hiddens/num_heads)
+    return X.reshape(-1, X.shape[2], X.shape[3])
+
+def transpose_output(X, num_heads):
+    """逆转transpose_qkv函数的操作"""
+    X = X.reshape(-1, num_heads, X.shape[1], X.shape[2])
+    X = X.transpose(0, 2, 1, 3)
+    return X.reshape(X.shape[0], X.shape[1], -1)
+
+# test 多头注意力输出的形状是（batch_size，num_queries，num_hiddens）。
+print("多头注意力")
+num_hiddens, num_heads = 100, 5
+attention = MultiHeadAttention(num_hiddens, num_heads, 0.5)
+attention.initialize()
+
+batch_size, num_queries = 2, 4
+num_kvpairs, valid_lens = 6, np.array([3, 2])
+X = np.ones((batch_size, num_queries, num_hiddens))
+Y = np.ones((batch_size, num_kvpairs, num_hiddens))
+print(attention(X, Y, Y, valid_lens).shape)

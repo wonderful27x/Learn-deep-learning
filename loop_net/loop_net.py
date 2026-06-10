@@ -219,6 +219,7 @@ def rnn(inputs, state, params):
     # 如一个时间步为4的序列time, 批量大小就是1，那么循环的顺序就应该是[time]
     for X in inputs:
         H = np.tanh(np.dot(X, W_xh) + np.dot(H, W_hh) + b_h)
+        print("隐状态: ", H.shape, H)
         Y = np.dot(H, W_hq) + b_q
         outputs.append(Y)
     return np.concatenate(outputs, axis=0), (H,)
@@ -353,11 +354,11 @@ num_epochs, lr = 500, 1
 num_hiddens = 512
 
 # 普通循环神经网络
-# v_get_params = get_parmas
-# v_layer = rnn
-# 门控循环神经网络
-v_get_params = get_parmas_gru
-v_layer = gru
+v_get_params = get_parmas
+v_layer = rnn
+# # 门控循环神经网络
+# v_get_params = get_parmas_gru
+# v_layer = gru
 net = RNNModelScratch(len(vocab), num_hiddens, d2l.try_gpu(),
                       v_get_params, init_state, v_layer)
 # test

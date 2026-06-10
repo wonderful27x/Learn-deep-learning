@@ -1,6 +1,7 @@
 import os
 import collections
 import math
+import pandas as pd
 from d2l import mxnet as d2l
 from mxnet import autograd, gluon, init, np, npx
 from mxnet.gluon import nn, rnn
@@ -157,6 +158,26 @@ def transpose_output(X, num_heads):
     X = X.reshape(-1, num_heads, X.shape[1], X.shape[2])
     X = X.transpose(0, 2, 1, 3)
     return X.reshape(X.shape[0], X.shape[1], -1)
+
+# 简单的注意力是没有位置关系的，前面我们将注意力引入到rnn循环神经网络中，
+# 是rnn内部建立的顺序，这里讨论的位置编码是利用正弦余弦波，将位置信息加再输入中
+# 同一个频率的波表示不同的位置，不同频率的波则区分特征维度
+# 具体公式查看10.6.3小节
+class PositionalEncoding(nn.Block):
+    """位置编码"""
+    def __init__(self, num_hiddens, dropout, max_len=1000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        # 创建一个足够长的P
+        self.P = np.zeros((1, max_len, num_hiddens))
+        X = np.arange(max_len).reshape(-1, 1) / np.power(
+            10000, np.arange(0, num_hiddens, 2) / num_hiddens)
+        self.P[:, :, 0::2] = np.sin(X)
+        self.P[:, :, 1::2] = np.cos(X)
+
+    def forward(self, X):
+        X = X + self.P[:, :X.shape[1], :].as_in_ctx(X.ctx)
+        return self.dropout(X)
 
 
 
@@ -348,7 +369,7 @@ class Encoder(nn.Block):
     def __init__(self, **kwargs):
         super(Encoder, self).__init__(**kwargs)
 
-    def forward(self, X, *args):
+    def forward(self, X, valid_lens, *args):
         raise NotImplementedError
 
 class Decoder(nn.Block):
@@ -370,99 +391,9 @@ class EncoderDecoder(nn.Block):
         self.decoder = decoder
 
     def forward(self, enc_X, dec_X, enc_valid_lens, *args):
-        enc_outputs = self.encoder(enc_X, *args)
+        enc_outputs = self.encoder(enc_X, enc_valid_lens, *args)
         dec_state = self.decoder.init_state(enc_outputs, enc_valid_lens, *args)
         return self.decoder(dec_X, dec_state)
-
-
-# 序列到序列学习的机器翻译实现
-# 编码器
-# 编码器将长度可变的输入序列转换成 形状固定的上下文变量
-class Seq2SeqEncoder(Encoder):
-    """用于序列到序列学习的循环神经网络编码器"""
-    def __init__(self, vocab_size, embed_size, num_hiddens, num_layers,
-                 dropout=0, **kwargs):
-        super(Seq2SeqEncoder, self).__init__(**kwargs)
-        # 嵌入层, 可学习的权重表示，和独热编码不同，但作用一样
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.rnn = rnn.GRU(num_hiddens, num_layers, dropout=dropout)
-
-    def forward(self, X, **args):
-        # 输出'X'的形状：(batch_size,num_steps,embed_size)
-        X = self.embedding(X)
-        # 在循环神经网络模型中，第一个轴对应于时间步
-        X = X.swapaxes(0, 1)
-        state = self.rnn.begin_state(batch_size=X.shape[1], ctx=X.ctx)
-        output, state = self.rnn(X, state)
-        # output的形状:(num_steps,batch_size,num_hiddens)
-        # state的形状:(num_layers,batch_size,num_hiddens)
-        return output, state
-
-# test
-print("测试encoder...")
-encoder = Seq2SeqEncoder(vocab_size=10, embed_size=8, num_hiddens=16, num_layers=2)
-encoder.initialize()
-X = np.zeros((4, 7))
-output, state = encoder(X)
-print(output.shape)
-print(len(state))
-print(state[0].shape)
-
-# 解码器
-class Seq2SeqDecoder(d2l.Decoder):
-    """用于序列到序列学习的循环神经网络解码器"""
-    def __init__(self, vocab_size, embed_size, num_hiddens, num_layers,
-                 dropout=0, **kwargs):
-        super(Seq2SeqDecoder, self).__init__(**kwargs)
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.rnn = rnn.GRU(num_hiddens, num_layers, dropout=dropout)
-        self.dense = nn.Dense(vocab_size, flatten=False)
-
-    def init_state(self, enc_outputs, enc_valid_lens, **args):
-        return enc_outputs[1]
-        # outputs的形状为(num_steps，batch_size，num_hiddens)
-        # hidden_state[0]的形状为(num_layers，batch_size，num_hiddens)
-
-    def forward(self, X, state):
-        # print(f'decoder input shape: {X.shape}')
-        # 输出'X'的形状：(batch_size,num_steps,embed_size)
-        X = self.embedding(X).swapaxes(0, 1)
-        # print(f'decoder input shape: {X.shape}')
-        # 取最后一层的隐藏状态 -> context的形状:(batch_size,num_hiddens)
-        context = state[0][-1]
-        # 广播context，使其具有与X相同的num_steps,
-        # 将编码器的输出state和X合并作为解码器输入，
-        # 注意这里是将编码器最后一个时间步的state拼接到解码器的每一个时间步上, 相当于做了多份拷贝
-        # 这里我们应该联想到因为拼接，所以权重矩阵W_x也被扩大了，
-        # 因为W_x的大小为inputsxnum_hiddens = (embed_size + num_hiddens) x num_hiddens = (32+32) x 32
-        # 这里可以测试一下, !!!需要用RNN网络测试, GRU需要x3
-        # print("解码器网络参数keys：", self.rnn.collect_params().keys)
-        # print("解码器网络权重矩阵：", self.rnn.collect_params())
-        # 这里特别需要理解的是,X实际是标签（label(t-1)),
-        # 将标签(不包含最后一个)作为输入,这称为强制教学，
-        # 按道理应该是用前面预测的输出作为输入去预测下一个词，
-        # 这里使用的确实标签，这样做有很多好处, 比如避免误差累计，收敛快等, 总之是通用做法
-        # 这里需要理解，内部算法有一个按时间步的for循环的计算过程就可以了
-        # 也就是按时间步进行输入，然后得到下一个预测词源
-        context = np.broadcast_to(context, (
-            X.shape[0], context.shape[0], context.shape[1]))
-        X_and_context = np.concatenate((X, context), 2)
-        output, state = self.rnn(X_and_context, state)
-        output = self.dense(output).swapaxes(0, 1)
-        # print("X.shape: ", X.shape, "X_and_context.shape: ", X_and_context.shape)
-        # output的形状:(batch_size,num_steps,vocab_size)
-        # state的形状:(num_layers,batch_size,num_hiddens)
-        return output, state
-
-# test decoder
-print("测试decoder...")
-decoder = Seq2SeqDecoder(vocab_size=10, embed_size=8, num_hiddens=16, num_layers=2)
-decoder.initialize()
-state = decoder.init_state(encoder(X), None)
-output, state = decoder(X, state)
-print(output.shape)
-print(len(state))
-print(state[0].shape)
 
 # 注意力解码器接口
 class AttentionDecoder(Decoder):
@@ -473,79 +404,213 @@ class AttentionDecoder(Decoder):
     def attention_weights(self):
         raise NotImplementedError
 
-class Seq2SeqAttentionDecoder(AttentionDecoder):
-    def __init__(self, vocab_size, embed_size, num_hiddens, num_layers,
-                 dropout=0, **kwargs):
-        super(Seq2SeqAttentionDecoder, self).__init__(**kwargs)
-        # self.attention = AdditiveAttention(num_hiddens, dropout)
-        self.attention = MultiHeadAttention(num_hiddens, 2, dropout)
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.rnn = rnn.GRU(num_hiddens, num_layers, dropout=dropout)
+
+# Transformer作为编码器－解码器架构的一个实例，与基于Bahdanau注意力实现的序列到序列的学习相比，Transformer的编码器和解码器是基于自注意力的模块叠加而成的，源（输入）序列和目标（输出）序列的嵌入（embedding）表示将加上位置编码（positional encoding），再分别输入到编码器和解码器中。
+# Transformer同时使用了多头自注意力（multi-head self-attention）汇聚、基于位置的前馈网络（positionwise feed-forward network）、残差网络和层规范化等技术，知识较广
+# 具体参见10.7.1. 模型 https://zh-v2.d2l.ai/chapter_attention-mechanisms/transformer.html#id3
+
+# 基于位置的前馈网络
+class PositionWiseFFN(nn.Block):
+    """基于位置的前馈网络"""
+    def __init__(self, ffn_num_hiddens, ffn_num_outputs, **kwargs):
+        super(PositionWiseFFN, self).__init__(**kwargs)
+        self.dense1 = nn.Dense(ffn_num_hiddens, flatten=False,
+                               activation='relu')
+        self.dense2 = nn.Dense(ffn_num_outputs, flatten=False)
+
+    def forward(self, X):
+        return self.dense2(self.dense1(X))
+
+print("基于位置的前馈网络测试")
+ffn = PositionWiseFFN(4, 8)
+ffn.initialize()
+print(ffn(np.ones((2, 3, 4)))[0])
+
+# 残差链接和层规范化
+# 层规范化是对一个样本的特征维度进行规范化，批量规范化则是跨样本对不同批次相同位置特征的规范化
+print("层规范化和批量规范化对比测试")
+ln = nn.LayerNorm()
+ln.initialize()
+bn = nn.BatchNorm()
+bn.initialize()
+X = np.array([[1, 2], [2, 3]])
+# 在训练模式下计算X的均值和方差
+with autograd.record():
+    print('层规范化:', ln(X), '\n批量规范化: ', bn(X))
+
+class AddNorm(nn.Block):
+    """残差连接后进行层规范化"""
+    def __init__(self, dropout, **kwargs):
+        super(AddNorm, self).__init__(**kwargs)
+        self.dropout = nn.Dropout(dropout)
+        self.ln = nn.LayerNorm()
+
+    def forward(self, X, Y):
+        return self.ln(self.dropout(Y) + X)
+
+# 编码器
+# EncoderBlock类包含两个子层：多头自注意力和基于位置的前馈网络，
+# 这两个子层都使用了残差连接和紧随的层规范化。
+class EncoderBlock(nn.Block):
+    """Transformer编码器块"""
+    def __init__(self, num_hiddens, ffn_num_hiddens, num_heads, dropout,
+                 use_bias=False, **kwargs):
+        super(EncoderBlock, self).__init__(**kwargs)
+        # 输出是形状：(batch_size, 查询个数, num_hiddens)
+        self.attention = MultiHeadAttention(num_hiddens, num_heads, dropout, use_bias)
+        # 残差链接层规范化不会改下形状
+        self.addnorm1 = AddNorm(dropout)
+        # 可以看到FFN进行了扩维ffn_num_hiddens, 然后非线性激活，最后又缩会num_hiddens维
+        self.ffn = PositionWiseFFN(ffn_num_hiddens, num_hiddens)
+        self.addnorm2 = AddNorm(dropout)
+
+    def forward(self, X, valid_lens):
+        Y = self.addnorm1(X, self.attention(X, X, X, valid_lens))
+        return self.addnorm2(Y, self.ffn(Y))
+
+print("transformer编码器层测试")
+X = np.ones((2, 100, 24))
+valid_lens = np.array([3, 2])
+encoder_blk = EncoderBlock(24, 48, 8, 0.5)
+encoder_blk.initialize()
+# 因为num_hiddens和输入X的特征维度一样，所以编码层不会改变输入形状
+print(encoder_blk(X, valid_lens).shape)
+
+# 下面实现的Transformer编码器的代码中，堆叠了num_layers个EncoderBlock类的实例。由于这里使用的是值范围在-1和1之间的固定位置编码，因此通过学习得到的输入的嵌入表示的值需要先乘以嵌入维度的平方根进行重新缩放，然后再与位置编码相加。
+class TransformerEncoder(Encoder):
+    """Transformer编码器"""
+    def __init__(self, vocab_size, num_hiddens, ffn_num_hiddens,
+                 num_heads, num_layers, dropout, use_bias=False, **kwargs):
+        super(TransformerEncoder, self).__init__(**kwargs)
+        self.num_hiddens = num_hiddens
+        self.embedding = nn.Embedding(vocab_size, num_hiddens)
+        self.pos_encoding = PositionalEncoding(num_hiddens, dropout)
+        self.blks = nn.Sequential()
+        for _ in range(num_layers):
+            self.blks.add(
+                    # 使用和embedding相同的num_hiddens，输出形状和输入一致
+                    EncoderBlock(num_hiddens, ffn_num_hiddens, num_heads,
+                                 dropout, use_bias))
+
+    def forward(self, X, valid_lens, *args):
+        # 因为位置编码值在-1和1之间，
+        # 因此嵌入值乘以嵌入维度的平方根进行缩放，
+        # 然后再与位置编码相加。
+        X = self.pos_encoding(self.embedding(X) * math.sqrt(self.num_hiddens))
+        self.attention_weights = [None] * len(self.blks)
+        for i, blk in enumerate(self.blks):
+            X = blk(X, valid_lens)
+            self.attention_weights[i] = blk.attention.attention.attention_weights
+        return X
+
+print("TransformerEncoder测试")
+encoder = TransformerEncoder(200, 24, 48, 8, 2, 0.5)
+encoder.initialize()
+# Transformer编码器输出的形状是（批量大小，时间步数目，num_hiddens）
+print(encoder(np.ones((2, 100)), valid_lens).shape)
+
+# 解码器
+# Transformer解码器也是由多个相同的层组成。在DecoderBlock类中实现的每个层包含了三个子层：解码器自注意力、“编码器-解码器”注意力和基于位置的前馈网络。这些子层也都被残差连接和紧随的层规范化围绕。
+# 在掩蔽多头解码器自注意力层（第一个子层）中，查询、键和值都来自上一个解码器层的输出。关于序列到序列模型（sequence-to-sequence model），在训练阶段，其输出序列的所有位置（时间步）的词元都是已知的；然而，在预测阶段，其输出序列的词元是逐个生成的。因此，在任何解码器时间步中，只有生成的词元才能用于解码器的自注意力计算中。为了在解码器中保留自回归的属性，其掩蔽自注意力设定了参数dec_valid_lens，以便任何查询都只会与解码器中所有已经生成词元的位置（即直到该查询位置为止）进行注意力计算。
+# 注意由于transformer中没有像之前的rnn网络那样按照时间步进行计算的过程，训练时输入的X的所有时间步是并行的，所以需要掩蔽操作，如下：
+#   a b c   有效长度
+# a o x x    1
+# b o o x    2
+# c o o o    3
+# 也就是a只能看到自己，b不能看到它前面的a和自己
+# 这样x的看不见的就设置权重为0
+class DecoderBlock(nn.Block):
+    def __init__(self, num_hiddens, ffn_num_hiddens, num_heads,
+                 dropout, i, **kwargs):
+        super(DecoderBlock, self).__init__(**kwargs)
+        self.i = i
+        # 这是解码器自注意力, 它的查询、键和值都来自上一个解码器层的输出
+        self.attention1 = MultiHeadAttention(num_hiddens, num_heads, dropout)
+        self.addnorm1 = AddNorm(dropout)
+        # “编码器-解码器”注意力, 它的查询来自前一个解码器层的输出，而键和值来自整个编码器的输出
+        self.attention2 = MultiHeadAttention(num_hiddens, num_heads, dropout)
+        self.addnorm2 = AddNorm(dropout)
+        self.ffn = PositionWiseFFN(ffn_num_hiddens, num_hiddens)
+        self.addnorm3 = AddNorm(dropout)
+
+    def forward(self, X, state):
+        enc_outputs, enc_valid_lens = state[0], state[1]
+        # 训练阶段，输出序列的所有词元都在同一时间处理，
+        # 因此state[2][self.i]初始化为None。
+        # 预测阶段，输出序列是通过词元一个接着一个解码的，
+        # 因此state[2][self.i]包含着直到当前时间步第i个块解码的输出表示
+        if state[2][self.i] is None:
+            key_values = X
+        else:
+            key_values = np.concatenate((state[2][self.i], X), axis=1)
+        state[2][self.i] = key_values
+
+        # 处理掩蔽
+        if autograd.is_training():
+            batch_size, num_steps, _ = X.shape
+            # dec_valid_lens的开头:(batch_size,num_steps),
+            # 其中每一行是[1,2,...,num_steps]
+            # 这样处理后在注意力层里面的masked_softmax就会屏蔽掉看不见的元素
+            # 假如时间步是3，那么[1, 2, 3]代表第1，2，3项查询的键的长度分别为1，2，3
+            # 可视化入下
+            #   a b c   有效长度
+            # a o x x    1
+            # b o o x    2
+            # c o o o    3
+            dec_valid_lens = np.tile(np.arange(1, num_steps + 1, ctx=X.ctx),
+                                     (batch_size, 1))
+        else:
+            # 预测时是按时间步输入的，不需要掩蔽
+            dec_valid_lens = None
+
+        # 解码器自注意力, 带掩码
+        X2 = self.attention1(X, key_values, key_values, dec_valid_lens)
+        Y = self.addnorm1(X, X2)
+        # “编码器－解码器”注意力。
+        # 'enc_outputs'的开头:('batch_size','num_steps','num_hiddens')
+        Y2 = self.attention2(Y, enc_outputs, enc_outputs, enc_valid_lens)
+        Z = self.addnorm2(Y, Y2)
+        return self.addnorm3(Z, self.ffn(Z)), state
+
+print("Transformer解码器层测试")
+decoder_blk = DecoderBlock(24, 48, 8, 0.5, 0)
+decoder_blk.initialize()
+X = np.ones((2, 100, 24))
+state = [encoder_blk(X, valid_lens), valid_lens, [None]]
+print(decoder_blk(X, state)[0].shape)
+
+# 现在我们构建了由num_layers个DecoderBlock实例组成的完整的Transformer解码器。最后，通过一个全连接层计算所有vocab_size个可能的输出词元的预测值。解码器的自注意力权重和编码器解码器注意力权重都被存储下来，方便日后可视化的需要。
+class TransformerDecoder(AttentionDecoder):
+    def __init__(self, vocab_size, num_hiddens, ffn_num_hiddens,
+                 num_heads, num_layers, dropout, **kwargs):
+        super(TransformerDecoder, self).__init__(**kwargs)
+        self.num_hiddens = num_hiddens
+        self.num_layers = num_layers
+        self.embedding = nn.Embedding(vocab_size, num_hiddens)
+        self.pos_encoding = PositionalEncoding(num_hiddens, dropout)
+        self.blks = nn.Sequential()
+        for i in range(num_layers):
+            self.blks.add(
+                    DecoderBlock(num_hiddens, ffn_num_hiddens, num_heads,
+                                 dropout, i))
         self.dense = nn.Dense(vocab_size, flatten=False)
 
     def init_state(self, enc_outputs, enc_valid_lens, *args):
-        # outputs的形状为(num_steps，batch_size，num_hiddens)
-        # hidden_state[0]的形状为(num_layers，batch_size，num_hiddens)
-        outputs, hidden_state = enc_outputs
-        return (outputs.swapaxes(0, 1), hidden_state, enc_valid_lens)
+        return [enc_outputs, enc_valid_lens, [None] * self.num_layers]
 
     def forward(self, X, state):
-        # enc_outputs的形状为(batch_size,num_steps,num_hiddens).
-        # hidden_state[0]的形状为(num_layers,batch_size,
-        # num_hiddens)
-        enc_outputs, hidden_state, enc_valid_lens = state
-        # 输出X的形状为(num_steps,batch_size,embed_size)
-        X = self.embedding(X).swapaxes(0, 1)
-        outputs, self._attention_weights = [], []
-        # 这里自己循环每个时间步是因为每个时间步输入的注意力不一样
-        # 外层进行循环rnn内部能根据输入的时间步数识别出来
-        for x in X:
-            # query的形状为(batch_size,1,num_hiddens)
-            query = np.expand_dims(hidden_state[0][-1], axis=1)
-            # context的形状为(batch_size,1,num_hiddens)
-            # query查询是解码器上一时间步最后一层隐状态
-            # 键-值对是编码器最后一层所有时间步隐状态
-            # 因此这里的context上下文就是编码器隐状态按查询对时间步的一个加权平均，
-            # 不再是之前的统统用最后一个时间步的隐状态
-            context = self.attention(query, enc_outputs, enc_outputs, enc_valid_lens)
-            # 在特征维度上连结
-            x = np.concatenate((context, np.expand_dims(x, axis=1)), axis=-1)
-            # 将x变形为(1,batch_size,embed_size+num_hiddens), 因为手动for循环只有一个时间步了
-            out, hidden_state = self.rnn(x.swapaxes(0, 1), hidden_state)
-            outputs.append(out)
-            self._attention_weights.append(self.attention.attention_weights)
-
-        # 全连接层变换后，outputs的形状为
-        # (num_steps,batch_size,vocab_size)
-        outputs = self.dense(np.concatenate(outputs, axis=0))
-        return outputs.swapaxes(0, 1), [enc_outputs, hidden_state, enc_valid_lens]
+        X = self.pos_encoding(self.embedding(X) * math.sqrt(self.num_hiddens))
+        self._attention_weights = [[None] * len(self.blks) for _ in range(2)]
+        for i, blk in enumerate(self.blks):
+            X, state = blk(X, state)
+            # 解码器自注意力权重
+            self._attention_weights[0][i] = blk.attention1.attention.attention_weights
+            # 编码器－解码器自注意力权重
+            self._attention_weights[1][i] = blk.attention2.attention.attention_weights
+        return self.dense(X), state
 
     def attention_weights(self):
         return self._attention_weights
-
-# 测试
-print("注意力解码器测试...")
-encoder = Seq2SeqEncoder(vocab_size=10, embed_size=8, num_hiddens=16, num_layers=2)
-encoder.initialize()
-decoder = Seq2SeqAttentionDecoder(vocab_size=10, embed_size=8, num_hiddens=16, num_layers=2)
-if isinstance(decoder.attention, AdditiveAttention):
-    print("加性注意力")
-elif isinstance(decoder.attention, DotProductAttention):
-    print("缩放点积注意力")
-elif isinstance(decoder.attention, MultiHeadAttention):
-    print("多头注意力")
-else:
-    print("未知注意力")
-
-decoder.initialize()
-X = np.zeros((4, 7)) # (batch_size, num_steps)
-state = decoder.init_state(encoder(X), None)
-output, state = decoder(X, state)
-print(output.shape)
-print(len(state))
-print(state[0].shape)
-print(len(state[1]))
-print(state[1][0].shape)
 
 
 # 损失函数
@@ -606,7 +671,6 @@ def train_seq2seq(net, data_iter, lr, num_epochs, src_vocab, tgt_vocab, device):
             dec_input = np.concatenate([bos, Y[:, :-1]], 1)
             with autograd.record():
                 Y_hat, _ = net(X, dec_input, X_valid_len)
-                # Y_hat, _ = net(X, dec_input)
                 l = loss(Y_hat, Y, Y_valid_len)
             l.backward()
             d2l.grad_clipping(net, 1)
@@ -618,17 +682,20 @@ def train_seq2seq(net, data_iter, lr, num_epochs, src_vocab, tgt_vocab, device):
     print(f'loss {metric[0] / metric[1]:.3f}, {metric[1] / timer.stop():.1f}'
           f'tokens/sec on {str(device)}')
 
-embed_size, num_hiddens, num_layers, dropout = 32, 32, 2, 0.1
+num_hiddens, num_layers, dropout = 32, 2, 0.1
 batch_size, num_steps = 64, 10
-lr, num_epochs, device = 0.005, 300, d2l.try_gpu()
+lr, num_epochs, device = 0.005, 200, d2l.try_gpu()
+ffn_num_hiddens, num_heads = 64, 4
 
 print("训练...")
 train_iter, src_vocab, tgt_vocab = load_data_nmt(batch_size, num_steps)
-encoder = Seq2SeqEncoder(len(src_vocab), embed_size, num_hiddens, num_layers, dropout)
-# decoder = Seq2SeqDecoder(len(tgt_vocab), embed_size, num_hiddens, num_layers, dropout)
-decoder = Seq2SeqAttentionDecoder(len(tgt_vocab), embed_size, num_hiddens, num_layers, dropout)
+encoder = TransformerEncoder(
+        len(src_vocab), num_hiddens, ffn_num_hiddens, num_heads, num_layers, dropout)
+decoder = TransformerDecoder(
+        len(tgt_vocab), num_hiddens, ffn_num_hiddens, num_heads, num_layers, dropout)
 net = EncoderDecoder(encoder, decoder)
 train_seq2seq(net, train_iter, lr, num_epochs, src_vocab, tgt_vocab, device)
+# d2l.train_seq2seq(net, train_iter, lr, num_epochs, tgt_vocab, device)
 
 # 预测
 def predict_seq2seq(net, src_sentence, src_vocab, tgt_vocab, num_steps,
@@ -640,7 +707,7 @@ def predict_seq2seq(net, src_sentence, src_vocab, tgt_vocab, num_steps,
     # 添加批量轴
     enc_X = np.expand_dims(np.array(src_tokens, ctx=device), axis=0)
     # print(f'encoder input shape: {enc_X.shape}')
-    enc_outputs = net.encoder(enc_X)
+    enc_outputs = net.encoder(enc_X, enc_valid_lens)
     dec_state = net.decoder.init_state(enc_outputs, enc_valid_lens)
     # 添加批量轴
     dec_X = np.expand_dims(np.array([tgt_vocab['<bos>']], ctx=device), axis=0)
@@ -684,14 +751,36 @@ print("预测...")
 engs = ['go .', "i lost .", 'he\'s calm .', 'i\'m home .']
 fras = ['va !', 'j\'ai perdu .', 'il est calme .', 'je suis chez moi .']
 for eng, fra in zip(engs, fras):
-    has_attention_weight = True if isinstance(decoder, AttentionDecoder) else False
-    translation, attention_weight_seq = predict_seq2seq(
-            net, eng, src_vocab, tgt_vocab, num_steps, device, has_attention_weight)
+    translation, dec_attention_weight_seq = predict_seq2seq(
+    # translation, dec_attention_weight_seq = d2l.predict_seq2seq(
+            net, eng, src_vocab, tgt_vocab, num_steps, device, True)
     print(f'{eng} => {translation}, bleu {bleu(translation, fra, k=2):.3f}')
 
-attention_weights = np.concatenate([step[0][0][0] for step in attention_weight_seq], 0
-    ).reshape((1, 1, -1, num_steps))
-# 加上一个包含序列结束词元
+# 当进行最后一个英语到法语的句子翻译工作时，让我们可视化Transformer的注意力权重。编码器自注意力权重的形状为（编码器层数，注意力头数，num_steps或查询的数目，num_steps或“键－值”对的数目）。
+enc_attention_weights = np.concatenate(net.encoder.attention_weights, 0).reshape((num_layers,
+    num_heads, -1, num_steps))
+print(enc_attention_weights.shape)
 d2l.show_heatmaps(
-    attention_weights[:, :, :, :len(engs[-1].split()) + 1],
-    xlabel='Key positions', ylabel='Query positions')
+    enc_attention_weights, xlabel='Key positions', ylabel='Query positions',
+    titles=['Head %d' % i for i in range(1, 5)], figsize=(7, 3.5))
+
+# 为了可视化解码器的自注意力权重和“编码器－解码器”的注意力权重，我们需要完成更多的数据操作工作。例如用零填充被掩蔽住的注意力权重。值得注意的是，解码器的自注意力权重和“编码器－解码器”的注意力权重都有相同的查询：即以序列开始词元（beginning-of-sequence,BOS）打头，再与后续输出的词元共同组成序列。
+dec_attention_weights_2d = [np.array(head[0]).tolist()
+                            for step in dec_attention_weight_seq
+                            for attn in step for blk in attn for head in blk]
+dec_attention_weights_filled = np.array(
+    pd.DataFrame(dec_attention_weights_2d).fillna(0.0).values)
+dec_attention_weights = dec_attention_weights_filled.reshape((-1, 2, num_layers, num_heads, num_steps))
+dec_self_attention_weights, dec_inter_attention_weights = \
+    dec_attention_weights.transpose(1, 2, 3, 0, 4)
+print(dec_self_attention_weights.shape, dec_inter_attention_weights.shape)
+# Plusonetoincludethebeginning-of-sequencetoken
+d2l.show_heatmaps(
+    dec_self_attention_weights[:, :, :, :len(translation.split()) + 1],
+    xlabel='Key positions', ylabel='Query positions',
+    titles=['Head %d' % i for i in range(1, 5)], figsize=(7, 3.5))
+
+d2l.show_heatmaps(
+    dec_inter_attention_weights, xlabel='Key positions',
+    ylabel='Query positions', titles=['Head %d' % i for i in range(1, 5)],
+    figsize=(7, 3.5))
