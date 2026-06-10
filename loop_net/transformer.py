@@ -130,7 +130,6 @@ class MultiHeadAttention(nn.Block):
         # output的形状:(batch_size*num_heads，查询的个数，
         # num_hiddens/num_heads)
         output = self.attention(queries, keys, values, valid_lens)
-        self.attention_weights = self.attention.attention_weights
 
         # output_concat的形状:(batch_size，查询的个数，num_hiddens), 和单头完全一致
         output_concat = transpose_output(output, self.num_heads)
@@ -369,7 +368,7 @@ class Encoder(nn.Block):
     def __init__(self, **kwargs):
         super(Encoder, self).__init__(**kwargs)
 
-    def forward(self, X, valid_lens, *args):
+    def forward(self, X, *args):
         raise NotImplementedError
 
 class Decoder(nn.Block):
@@ -377,7 +376,7 @@ class Decoder(nn.Block):
     def __init__(self, **kwargs):
         super(Decoder, self).__init__(**kwargs)
 
-    def init_state(self, enc_outputs, enc_valid_lens, *args):
+    def init_state(self, enc_outputs, *args):
         raise NotImplementedError
 
     def forward(self, X, state):
@@ -390,9 +389,9 @@ class EncoderDecoder(nn.Block):
         self.encoder = encoder
         self.decoder = decoder
 
-    def forward(self, enc_X, dec_X, enc_valid_lens, *args):
-        enc_outputs = self.encoder(enc_X, enc_valid_lens, *args)
-        dec_state = self.decoder.init_state(enc_outputs, enc_valid_lens, *args)
+    def forward(self, enc_X, dec_X, *args):
+        enc_outputs = self.encoder(enc_X, *args)
+        dec_state = self.decoder.init_state(enc_outputs, *args)
         return self.decoder(dec_X, dec_state)
 
 # 注意力解码器接口
@@ -401,6 +400,7 @@ class AttentionDecoder(Decoder):
     def __init__(self, **kwargs):
         super(AttentionDecoder, self).__init__(**kwargs)
 
+    @property
     def attention_weights(self):
         raise NotImplementedError
 
@@ -609,6 +609,7 @@ class TransformerDecoder(AttentionDecoder):
             self._attention_weights[1][i] = blk.attention2.attention.attention_weights
         return self.dense(X), state
 
+    @property
     def attention_weights(self):
         return self._attention_weights
 
@@ -724,7 +725,7 @@ def predict_seq2seq(net, src_sentence, src_vocab, tgt_vocab, num_steps,
         pred = dec_X.squeeze(axis=0).astype('int32').item()
         # 保存注意力权重
         if save_attention_weight:
-            attension_weight_seq.append(net.decoder.attention_weights())
+            attension_weight_seq.append(net.decoder.attention_weights)
         if pred == tgt_vocab['<eos>']:
             break
         output_seq.append(pred)
